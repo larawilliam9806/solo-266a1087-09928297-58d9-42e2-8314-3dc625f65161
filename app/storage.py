@@ -144,25 +144,27 @@ def load_answers(connection, household_id):
 def save_answers(connection, household_id, changes):
     """Persist ``{key: value_or_None}`` for one household.
 
-    ``key`` is ``(prefix_tuple, qid)``; ``None`` deletes.  All changes are
-    written in a single transaction, so a failure leaves the previous answers
-    fully intact.
+    ``key`` is ``(prefix_tuple, qid)``; ``None`` deletes.  Must run inside
+    ``transaction()`` together with the read and conflict check that
+    produced ``changes``: one transaction keeps a failure from exposing
+    half-written answers, and the immediate write lock makes two
+    interleaved saves verify against each other's committed answers
+    instead of silently overwriting them.
     """
-    with transaction(connection):
-        for (prefix, qid), value in changes.items():
-            key = _prefix_key(prefix)
-            if value is None:
-                connection.execute(
-                    "DELETE FROM answers WHERE household_id = ? "
-                    "AND prefix = ? AND qid = ?",
-                    (household_id, key, qid))
-            else:
-                connection.execute(
-                    "INSERT INTO answers (household_id, prefix, qid, value) "
-                    "VALUES (?, ?, ?, ?) "
-                    "ON CONFLICT (household_id, prefix, qid) "
-                    "DO UPDATE SET value = excluded.value",
-                    (household_id, key, qid, value))
+    for (prefix, qid), value in changes.items():
+        key = _prefix_key(prefix)
+        if value is None:
+            connection.execute(
+                "DELETE FROM answers WHERE household_id = ? "
+                "AND prefix = ? AND qid = ?",
+                (household_id, key, qid))
+        else:
+            connection.execute(
+                "INSERT INTO answers (household_id, prefix, qid, value) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (household_id, prefix, qid) "
+                "DO UPDATE SET value = excluded.value",
+                (household_id, key, qid, value))
 
 
 def db_path_from_env():

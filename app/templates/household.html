@@ -37,6 +37,7 @@
           <input type="hidden" name="k_qid_{{ index }}" value="{{ step.qid }}">
           <input type="hidden" name="k_prefix_{{ index }}"
                  value="{{ step.prefix|tojson|forceescape }}">
+          <input type="hidden" name="k_orig_{{ index }}" value="{{ step.value }}">
           {% if step.type == "single" %}
             <div class="options">
               {% for option in step.options %}
@@ -84,7 +85,9 @@
     <button type="submit">保存</button>
     <a class="button secondary" href="{{ url_for('export_csv', batch_id=batch.id) }}">下载分析用 CSV</a>
   </form>
-  <p class="muted">提示：切换前面的单选题后，请先保存再用新路径继续填写；未保存的输入不会跟随路径移动。</p>
+  <p class="muted">提示：切换前面的单选题后，请先保存再用新路径继续填写；未保存的输入不会跟随路径移动。
+    保存只应用相对页面原值实际改动的题目；若某题在保存前已被其他窗口改动（或已无法沿原路径到达），
+    本次保存会整批拒绝并指出冲突题，页面重新显示最新保存的答卷。</p>
 </section>
 
 {% if others %}

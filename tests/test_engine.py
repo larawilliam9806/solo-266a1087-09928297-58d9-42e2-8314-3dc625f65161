@@ -110,50 +110,146 @@ def test_switch_back_restores_path_answers():
         ("Q1", "自购"), ("Q2", "")]
 
 
-def test_plan_changes_ignores_off_path_fields():
+def test_plan_changes_applies_only_actual_edits():
     defn = definition()
-    stored = {((), "Q1"): "自购", (("Q1",), "Q2"): "喷药机"}
-    changes, ignored = engine.plan_changes(defn, stored, [
-        ("Q1", (), "租赁"),
-        ("Q2", ("Q1",), "喷药机"),
-        ("Q5", ("Q1",), "按年"),
-        ("Q6", ("Q1", "Q5"), "3"),
-        ("Q7", RENT_PREFIX, "8000"),
-    ])
-    assert changes == {
-        ((), "Q1"): "租赁",
-        (("Q1",), "Q5"): "按年",
-        (("Q1", "Q5"), "Q6"): "3",
-        (RENT_PREFIX, "Q7"): "8000",
+    stored = {
+        ((), "Q1"): "自购",
+        (("Q1",), "Q2"): "喷药机",
+        (("Q1", "Q2"), "Q3"): "2",
+        (("Q1", "Q2", "Q3"), "Q4"): "无",
+        (SELF_PREFIX, "Q7"): "12000",
     }
-    assert ignored == ["Q2"]
+    # A full-page submit where only Q3 was edited on the page.
+    changes, ignored = engine.plan_changes(defn, stored, [
+        ("Q1", (), "自购", "自购"),
+        ("Q2", ("Q1",), "喷药机", "喷药机"),
+        ("Q3", ("Q1", "Q2"), "2", "3"),
+        ("Q4", ("Q1", "Q2", "Q3"), "无", "无"),
+        ("Q7", SELF_PREFIX, "12000", "12000"),
+    ])
+    assert changes == {(("Q1", "Q2"), "Q3"): "3"}
+    assert ignored == []
+
+
+def test_plan_changes_from_stale_page_keeps_other_windows_edit():
+    """The reported bug: window A saved Q3=3; window B's stale page still
+    shows Q3=2 but B only edited Q7.  B's save must not revert Q3."""
+    defn = definition()
+    stored = {
+        ((), "Q1"): "自购",
+        (("Q1",), "Q2"): "喷药机",
+        (("Q1", "Q2"), "Q3"): "3",
+        (("Q1", "Q2", "Q3"), "Q4"): "无",
+        (SELF_PREFIX, "Q7"): "12000",
+    }
+    changes, ignored = engine.plan_changes(defn, stored, [
+        ("Q1", (), "自购", "自购"),
+        ("Q2", ("Q1",), "喷药机", "喷药机"),
+        ("Q3", ("Q1", "Q2"), "2", "2"),  # stale page value, not an edit
+        ("Q4", ("Q1", "Q2", "Q3"), "无", "无"),
+        ("Q7", SELF_PREFIX, "12000", "13000"),
+    ])
+    assert changes == {(SELF_PREFIX, "Q7"): "13000"}
+    assert ignored == []
     merged = dict(stored)
     merged.update(changes)
-    assert merged[(("Q1",), "Q2")] == "喷药机"
+    assert merged[(("Q1", "Q2"), "Q3")] == "3"
+    assert merged[(SELF_PREFIX, "Q7")] == "13000"
+
+
+def test_plan_changes_clearing_counts_as_edit():
+    defn = definition()
+    stored = {((), "Q1"): "自购", (("Q1",), "Q2"): "喷药机",
+              (("Q1",), "Q5"): "按年"}
+    changes, ignored = engine.plan_changes(defn, stored, [
+        ("Q1", (), "自购", "自购"),
+        ("Q2", ("Q1",), "喷药机", "")])
+    assert changes == {(("Q1",), "Q2"): None}
+    assert ignored == []
+    merged = dict(stored)
+    for key, value in changes.items():
+        if value is None:
+            del merged[key]
+    assert (("Q1",), "Q5") in merged
+
+
+def test_plan_changes_conflict_when_value_moved_on():
+    defn = definition()
+    stored = {
+        ((), "Q1"): "自购",
+        (("Q1",), "Q2"): "喷药机",
+        (("Q1", "Q2"), "Q3"): "5",  # another window saved 5 in the meantime
+    }
+    with pytest.raises(engine.ConflictError) as excinfo:
+        engine.plan_changes(defn, stored, [
+            ("Q1", (), "自购", "自购"),
+            ("Q2", ("Q1",), "喷药机", "喷药机"),
+            ("Q3", ("Q1", "Q2"), "2", "3"),
+        ])
+    assert "Q3" in str(excinfo.value)
+
+
+def test_plan_changes_conflict_when_question_unreachable():
+    defn = definition()
+    # Another window switched the route to rental.
+    stored = {((), "Q1"): "租赁", (("Q1",), "Q5"): "按年"}
+    with pytest.raises(engine.ConflictError) as excinfo:
+        engine.plan_changes(defn, stored, [
+            ("Q1", (), "自购", "自购"),  # not edited on this page
+            ("Q3", ("Q1", "Q2"), "2", "4"),
+        ])
+    assert "Q3" in str(excinfo.value)
+
+
+def test_plan_changes_same_value_already_saved_is_not_a_conflict():
+    defn = definition()
+    stored = {
+        ((), "Q1"): "自购",
+        (("Q1",), "Q2"): "喷药机",
+        (("Q1", "Q2"), "Q3"): "3",  # the same edit was already saved
+    }
+    changes, ignored = engine.plan_changes(defn, stored, [
+        ("Q1", (), "自购", "自购"),
+        ("Q2", ("Q1",), "喷药机", "喷药机"),
+        ("Q3", ("Q1", "Q2"), "2", "3"),
+    ])
+    assert changes == {}
+    assert ignored == []
+
+
+def test_plan_changes_own_reroute_leaves_later_edits_behind():
+    """Skips caused by this save's own edits follow the original rules."""
+    defn = definition()
+    stored = {
+        ((), "Q1"): "自购",
+        (("Q1",), "Q2"): "喷药机",
+        (("Q1", "Q2"), "Q3"): "2",
+        (("Q1", "Q2", "Q3"), "Q4"): "无",
+        (SELF_PREFIX, "Q7"): "12000",
+    }
+    # 采摘平台 jumps straight to Q7, so the Q3 edit is left behind.
+    changes, ignored = engine.plan_changes(defn, stored, [
+        ("Q1", (), "自购", "自购"),
+        ("Q2", ("Q1",), "喷药机", "采摘平台"),
+        ("Q3", ("Q1", "Q2"), "2", "5"),
+    ])
+    assert changes == {(("Q1",), "Q2"): "采摘平台"}
+    assert ignored == ["Q3"]
+    merged = dict(stored)
+    merged.update(changes)
+    assert merged[(("Q1", "Q2"), "Q3")] == "2"  # untouched on its own path
+    assert merged[(SELF_PREFIX, "Q7")] == "12000"
 
 
 def test_plan_changes_preserves_old_branch_when_switching():
     defn = definition()
     stored = {((), "Q1"): "租赁", (("Q1",), "Q5"): "按年"}
-    changes, ignored = engine.plan_changes(defn, stored, [("Q1", (), "自购")])
+    changes, ignored = engine.plan_changes(
+        defn, stored, [("Q1", (), "租赁", "自购")])
     assert changes == {((), "Q1"): "自购"}
     assert ignored == []
     merged = dict(stored)
     merged.update(changes)
-    assert (("Q1",), "Q5") in merged
-
-
-def test_plan_changes_clears_only_current_path():
-    defn = definition()
-    stored = {((), "Q1"): "自购", (("Q1",), "Q2"): "喷药机",
-              (("Q1",), "Q5"): "按年"}
-    changes, _ = engine.plan_changes(defn, stored, [
-        ("Q1", (), "自购"), ("Q2", ("Q1",), "")])
-    assert changes == {(("Q1",), "Q2"): None}
-    merged = dict(stored)
-    for key, value in changes.items():
-        if value is None:
-            del merged[key]
     assert (("Q1",), "Q5") in merged
 
 
@@ -170,7 +266,12 @@ def test_shared_cost_question_is_stored_per_path():
         (RENT_PREFIX, "Q7"): "8000",
     }
     changes, ignored = engine.plan_changes(defn, stored, [
-        ("Q1", (), "自购"), ("Q7", SELF_PREFIX, "15000")])
+        ("Q1", (), "自购", "自购"),
+        ("Q2", ("Q1",), "喷药机", "喷药机"),
+        ("Q3", ("Q1", "Q2"), "2", "2"),
+        ("Q4", ("Q1", "Q2", "Q3"), "无", "无"),
+        ("Q7", SELF_PREFIX, "12000", "15000"),
+    ])
     assert changes == {(SELF_PREFIX, "Q7"): "15000"}
     assert ignored == []
     merged = dict(stored)
@@ -179,20 +280,22 @@ def test_shared_cost_question_is_stored_per_path():
     assert merged[(RENT_PREFIX, "Q7")] == "8000"
 
 
-def test_plan_changes_uses_prefix_reported_on_form():
+def test_plan_changes_rejects_edit_on_moved_route():
     defn = definition()
     stored = {((), "Q1"): "自购"}
-    # The form was rendered on the rental route, but Q1 now says 自购, so the
-    # rental-only Q5 field (with the rental prefix) is stale.
-    changes, ignored = engine.plan_changes(defn, stored, [
-        ("Q1", (), "自购"), ("Q5", ("Q1",), "按年")])
-    assert changes == {}
-    assert ignored == ["Q5"]
+    # The page was rendered on the rental route, but the stored route is
+    # self-buy now: the Q5 edit can no longer be reached on its old path.
+    with pytest.raises(engine.ConflictError) as excinfo:
+        engine.plan_changes(defn, stored, [
+            ("Q1", (), "自购", "自购"),
+            ("Q5", ("Q1",), "", "按年"),
+        ])
+    assert "Q5" in str(excinfo.value)
 
 
 def test_invalid_option_is_rejected():
     with pytest.raises(engine.DefinitionError):
-        engine.plan_changes(definition(), {}, [("Q1", (), "丢弃")])
+        engine.plan_changes(definition(), {}, [("Q1", (), "", "丢弃")])
 
 
 def test_first_missing():

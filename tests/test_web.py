@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 
 import pytest
 
@@ -61,41 +62,57 @@ def upload(client, csv_text=CSV_TEXT, jumps=JUMPS):
 
 
 def form_fields(body):
-    """(qid, prefix, value) for every question rendered on the edit page."""
+    """``[qid, prefix, original, value]`` for every question on the page."""
     entries = []
     pattern = re.compile(
         r'name="k_qid_(\d+)"\s+value="([^"]*)">\s*'
-        r'<input\s+type="hidden"\s+name="k_prefix_\1"\s+value="([^"]*)"',
+        r'<input\s+type="hidden"\s+name="k_prefix_\1"\s+value="([^"]*)">\s*'
+        r'<input\s+type="hidden"\s+name="k_orig_\1"\s+value="([^"]*)"',
         re.S)
-    for index, qid, prefix in pattern.findall(body):
+    for index, qid, prefix, original in pattern.findall(body):
         tags = re.findall(r'<input[^>]*name="v_%s"[^>]*>' % index, body, re.S)
         chosen = next((tag for tag in tags if "checked" in tag),
                       tags[0] if tags else "")
         value_match = re.search(r'data-value="([^"]*)"', chosen)
-        entries.append((html.unescape(qid), json.loads(html.unescape(prefix)),
+        entries.append([html.unescape(qid),
+                        tuple(json.loads(html.unescape(prefix))),
+                        html.unescape(original),
                         html.unescape(value_match.group(1)) if value_match
-                        else ""))
+                        else ""])
     return entries
 
 
 def values(body):
-    return {(qid, tuple(prefix)): value
-            for qid, prefix, value in form_fields(body)}
+    return {(qid, prefix): value
+            for qid, prefix, _original, value in form_fields(body)}
 
 
 def submit(client, entries, household=2):
     data = {}
-    for position, (qid, prefix, value) in enumerate(entries, start=1):
+    for position, (qid, prefix, original, value) in enumerate(entries, 1):
         data["k_qid_%d" % position] = qid
         data["k_prefix_%d" % position] = json.dumps(list(prefix))
+        data["k_orig_%d" % position] = original
         data["v_%d" % position] = value
     return client.post("/batch/1/household/%d" % household, data=data,
                        follow_redirects=True).get_data(as_text=True)
 
 
 def replace(entries, qid, prefix, value):
-    return [(q, tuple(p), value if (q == qid and tuple(p) == tuple(prefix))
-             else v) for q, p, v in entries]
+    return [[q, p, o, value if (q == qid and tuple(p) == tuple(prefix))
+             else v] for q, p, o, v in entries]
+
+
+def fill(client, body, household, edits):
+    """Save edits one at a time, following the re-rendered page.
+
+    The walk stops at the first blank question, so a freshly entered branch
+    reveals one question per save.
+    """
+    for qid, prefix, value in edits:
+        body = submit(client, replace(form_fields(body), qid, prefix, value),
+                      household=household)
+    return body
 
 
 SELF = ("Q1", "Q2", "Q3", "Q4")
@@ -113,16 +130,16 @@ def test_self_buy_path_and_shared_cost(client):
     upload(client)
     fields = form_fields(
         client.get("/batch/1/household/1").get_data(as_text=True))
-    assert [qid for qid, _, _ in fields] == ["Q1", "Q2", "Q3", "Q4", "Q7"]
-    assert dict((q, v) for q, _, v in fields)["Q7"] == "12000"
+    assert [qid for qid, _, _, _ in fields] == ["Q1", "Q2", "Q3", "Q4", "Q7"]
+    assert dict((q, v) for q, _, _, v in fields)["Q7"] == "12000"
 
 
 def test_rental_path_skips_self_buy_questions(client):
     upload(client)
     fields = form_fields(
         client.get("/batch/1/household/2").get_data(as_text=True))
-    assert [qid for qid, _, _ in fields] == ["Q1", "Q5", "Q6", "Q7"]
-    assert dict((q, v) for q, _, v in fields)["Q7"] == "8000"
+    assert [qid for qid, _, _, _ in fields] == ["Q1", "Q5", "Q6", "Q7"]
+    assert dict((q, v) for q, _, _, v in fields)["Q7"] == "8000"
 
 
 def test_import_ignores_unreached_answers(client):
@@ -141,28 +158,29 @@ def test_import_ignores_unreached_answers(client):
 
 def test_switch_branch_saves_separate_answers(client):
     upload(client)
-    # H2 starts on the rental route.
-    body = client.post("/batch/1/household/2", data={
-        "k_qid_1": "Q1", "k_prefix_1": "[]", "v_1": "自购",
-        "k_qid_2": "Q2", "k_prefix_2": '["Q1"]', "v_2": "喷药机",
-        "k_qid_3": "Q3", "k_prefix_3": '["Q1", "Q2"]', "v_3": "4",
-        "k_qid_4": "Q4", "k_prefix_4": '["Q1", "Q2", "Q3"]', "v_4": "无",
-        "k_qid_5": "Q7", "k_prefix_5": '["Q1", "Q2", "Q3", "Q4"]',
-        "v_5": "15000",
-    }, follow_redirects=True).get_data(as_text=True)
+    # H2 starts on the rental route; switch the source question and save.
+    fields = form_fields(
+        client.get("/batch/1/household/2").get_data(as_text=True))
+    body = submit(client, replace(fields, "Q1", (), "自购"))
+
+    # The page now walks the self-buy route; fill it in and save again.
+    assert [qid for qid, _, _, _ in form_fields(body)] == ["Q1", "Q2"]
+    body = fill(client, body, 2, [
+        ("Q2", ("Q1",), "喷药机"),
+        ("Q3", ("Q1", "Q2"), "4"),
+        ("Q4", ("Q1", "Q2", "Q3"), "无"),
+        ("Q7", SELF, "15000"),
+    ])
 
     assert "其他路径上保存的答案" in body
     current = values(body)
     assert current[("Q1", ())] == "自购"
     assert current[("Q7", SELF)] == "15000"
     # The rental path's answers are still stored.
-    assert current[("Q5", ("Q1",))] if ("Q5", ("Q1",)) in current else True
     assert "按年整租" in body and "8000" in body
 
     # Switch back to rental: its own answers return, including its cost.
-    body = client.post("/batch/1/household/2", data={
-        "k_qid_1": "Q1", "k_prefix_1": "[]", "v_1": "租赁",
-    }, follow_redirects=True).get_data(as_text=True)
+    body = submit(client, replace(form_fields(body), "Q1", (), "租赁"))
     current = values(body)
     assert current[("Q5", ("Q1",))] == "按年整租"
     assert current[("Q6", ("Q1", "Q5"))] == "3"
@@ -177,23 +195,19 @@ def test_shared_cost_question_is_per_path(client):
     body = submit(client, replace(fields, "Q7", RENT, "9000"))
     assert values(body)[("Q7", RENT)] == "9000"
 
-    # Move to self-buy: the cost shows the self-buy value, not 9000.
-    body = client.post("/batch/1/household/2", data={
-        "k_qid_1": "Q1", "k_prefix_1": "[]", "v_1": "自购",
-        "k_qid_2": "Q2", "k_prefix_2": '["Q1"]', "v_2": "喷药机",
-        "k_qid_3": "Q3", "k_prefix_3": '["Q1", "Q2"]', "v_3": "4",
-        "k_qid_4": "Q4", "k_prefix_4": '["Q1", "Q2", "Q3"]', "v_4": "无",
-        "k_qid_5": "Q7", "k_prefix_5": '["Q1", "Q2", "Q3", "Q4"]',
-        "v_5": "",
-    }, follow_redirects=True).get_data(as_text=True)
+    # Move to self-buy: save the route switch, then fill the new branch.
+    body = submit(client, replace(form_fields(body), "Q1", (), "自购"))
+    body = fill(client, body, 2, [
+        ("Q2", ("Q1",), "喷药机"),
+        ("Q3", ("Q1", "Q2"), "4"),
+        ("Q4", ("Q1", "Q2", "Q3"), "无"),
+    ])
     current = values(body)
     assert current[("Q7", SELF)] == ""
     assert "9000" in body  # still visible as another path's answer
 
     # Return to rental: 9000 is intact.
-    body = client.post("/batch/1/household/2", data={
-        "k_qid_1": "Q1", "k_prefix_1": "[]", "v_1": "租赁",
-    }, follow_redirects=True).get_data(as_text=True)
+    body = submit(client, replace(form_fields(body), "Q1", (), "租赁"))
     assert values(body)[("Q7", RENT)] == "9000"
 
 
@@ -201,17 +215,168 @@ def test_stale_fields_of_old_route_are_not_saved(client):
     upload(client)
     fields = form_fields(
         client.get("/batch/1/household/2").get_data(as_text=True))
-    # Keep every rental field but change the route: they are now stale.
-    body = submit(client, [("Q1", (), "自购")] + fields[1:])
+    # Keep every rental field as shown but change the route: only the
+    # Q1 edit is applied, the untouched fields follow no one anywhere.
+    body = submit(client, replace(fields, "Q1", (), "自购"))
     current = values(body)
     assert [q for q, _ in current] == ["Q1", "Q2"]
     assert current[("Q2", ("Q1",))] == ""
 
 
+def test_two_windows_keep_each_others_edits(client):
+    """The reported bug: one household open in two windows."""
+    upload(client)
+    page = client.get("/batch/1/household/1").get_data(as_text=True)
+    window_a = form_fields(page)
+    window_b = form_fields(page)
+
+    # Window A: 自购台数 2 -> 3.
+    body = submit(client, replace(window_a, "Q3", ("Q1", "Q2"), "3"),
+                  household=1)
+    assert values(body)[("Q3", ("Q1", "Q2"))] == "3"
+
+    # Window B (stale page, still shows 台数=2): only edits 年费用.
+    body = submit(client, replace(window_b, "Q7", SELF, "13000"),
+                  household=1)
+    current = values(body)
+    assert current[("Q7", SELF)] == "13000"
+    # 台数 must not fall back to the stale 2.
+    assert current[("Q3", ("Q1", "Q2"))] == "3"
+
+    export = client.get("/batch/1/export.csv").data.decode("utf-8-sig")
+    header = export.splitlines()[0].split(",")
+    h1 = next(line for line in export.splitlines() if line.startswith("H1"))
+    cells = h1.split(",")
+    assert cells[header.index("Q3 自购台数")] == "3"
+    assert cells[header.index("Q7 年费用合计（元）")] == "13000"
+
+
+def test_conflicting_edit_rejects_whole_save(client):
+    upload(client)
+    page = client.get("/batch/1/household/1").get_data(as_text=True)
+    window_a = form_fields(page)
+    window_b = form_fields(page)
+
+    # Window A: 台数 2 -> 3.
+    submit(client, replace(window_a, "Q3", ("Q1", "Q2"), "3"), household=1)
+    # Window B also edited 台数 (2 -> 5) plus 年费用: whole save rejected.
+    entries = replace(window_b, "Q3", ("Q1", "Q2"), "5")
+    entries = replace(entries, "Q7", SELF, "13000")
+    body = submit(client, entries, household=1)
+    assert "保存失败" in body and "Q3" in body
+
+    # Nothing from B was saved: Q3 stays 3, Q7 stays 12000.
+    current = values(client.get("/batch/1/household/1").get_data(as_text=True))
+    assert current[("Q3", ("Q1", "Q2"))] == "3"
+    assert current[("Q7", SELF)] == "12000"
+    export = client.get("/batch/1/export.csv").data.decode("utf-8-sig")
+    h1 = next(line for line in export.splitlines() if line.startswith("H1"))
+    assert "13000" not in h1
+
+
+def test_edit_on_unreachable_path_rejects_whole_save(client):
+    upload(client)
+    page = client.get("/batch/1/household/1").get_data(as_text=True)
+    window_a = form_fields(page)
+    window_b = form_fields(page)
+
+    # Window A switches the household to the rental route.
+    submit(client, replace(window_a, "Q1", (), "租赁"), household=1)
+    # Window B edited 台数, which is no longer reachable on its old path.
+    body = submit(client, replace(window_b, "Q3", ("Q1", "Q2"), "5"),
+                  household=1)
+    assert "保存失败" in body and "Q3" in body
+
+    current = values(client.get("/batch/1/household/1").get_data(as_text=True))
+    assert current[("Q1", ())] == "租赁"
+
+
+def test_same_edit_from_two_windows_is_not_a_conflict(client):
+    upload(client)
+    page = client.get("/batch/1/household/1").get_data(as_text=True)
+    window_a = form_fields(page)
+    window_b = form_fields(page)
+    body = submit(client, replace(window_a, "Q3", ("Q1", "Q2"), "3"),
+                  household=1)
+    assert "已保存" in body
+    body = submit(client, replace(window_b, "Q3", ("Q1", "Q2"), "3"),
+                  household=1)
+    assert "保存失败" not in body
+    assert values(body)[("Q3", ("Q1", "Q2"))] == "3"
+
+
+def test_interleaved_saves_keep_both_edits(client):
+    """Two windows saving at the same time, each editing one question."""
+    upload(client)
+    import main
+    page = client.get("/batch/1/household/1").get_data(as_text=True)
+    entries = {
+        "a": replace(form_fields(page), "Q3", ("Q1", "Q2"), "3"),
+        "b": replace(form_fields(page), "Q7", SELF, "13000"),
+    }
+    barrier = threading.Barrier(2)
+    bodies = {}
+
+    def save(name):
+        with main.app.test_client() as own_client:
+            barrier.wait(timeout=10)
+            bodies[name] = submit(own_client, entries[name], household=1)
+
+    threads = [threading.Thread(target=save, args=(name,)) for name in "ab"]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not any(thread.is_alive() for thread in threads)
+
+    assert sum("已保存 1 处修改" in body for body in bodies.values()) == 2
+    current = values(client.get("/batch/1/household/1").get_data(as_text=True))
+    assert current[("Q3", ("Q1", "Q2"))] == "3"
+    assert current[("Q7", SELF)] == "13000"
+
+
+def test_interleaved_conflicting_saves_exactly_one_wins(client):
+    """Interleaved saves of the same question follow the same rules."""
+    upload(client)
+    import main
+    page = client.get("/batch/1/household/1").get_data(as_text=True)
+    entries = {
+        "a": replace(form_fields(page), "Q3", ("Q1", "Q2"), "3"),
+        "b": replace(form_fields(page), "Q3", ("Q1", "Q2"), "5"),
+    }
+    barrier = threading.Barrier(2)
+    bodies = {}
+
+    def save(name):
+        with main.app.test_client() as own_client:
+            barrier.wait(timeout=10)
+            bodies[name] = submit(own_client, entries[name], household=1)
+
+    threads = [threading.Thread(target=save, args=(name,)) for name in "ab"]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not any(thread.is_alive() for thread in threads)
+
+    assert sum("已保存" in body for body in bodies.values()) == 1
+    losers = [body for body in bodies.values() if "保存失败" in body]
+    assert len(losers) == 1 and "Q3" in losers[0]
+
+    current = values(client.get("/batch/1/household/1").get_data(as_text=True))
+    assert current[("Q3", ("Q1", "Q2"))] in ("3", "5")
+    # The CSV download agrees with the page.
+    export = client.get("/batch/1/export.csv").data.decode("utf-8-sig")
+    header = export.splitlines()[0].split(",")
+    h1 = next(line for line in export.splitlines() if line.startswith("H1"))
+    assert h1.split(",")[header.index("Q3 自购台数")] == \
+        current[("Q3", ("Q1", "Q2"))]
+
+
 def test_invalid_single_option_rejected_and_previous_answers_kept(client):
     upload(client)
     response = client.post("/batch/1/household/2", data={
-        "k_qid_1": "Q1", "k_prefix_1": "[]", "v_1": "丢弃",
+        "k_qid_1": "Q1", "k_prefix_1": "[]", "k_orig_1": "租赁", "v_1": "丢弃",
     }, follow_redirects=True)
     assert "保存失败" in response.get_data(as_text=True)
     export = client.get("/batch/1/export.csv").data.decode("utf-8-sig")
@@ -259,15 +424,16 @@ def test_clearing_answer_stops_path(client):
     fields = form_fields(
         client.get("/batch/1/household/2").get_data(as_text=True))
     body = submit(client, replace(fields, "Q5", ("Q1",), ""))
-    assert [qid for qid, _, _ in form_fields(body)] == ["Q1", "Q5"]
+    assert [qid for qid, _, _, _ in form_fields(body)] == ["Q1", "Q5"]
 
 
 def test_jump_directly_to_shared_cost_question(client):
     upload(client)
     # 自购 + 采摘平台 jumps straight to Q7, skipping Q3/Q4.
     body = client.post("/batch/1/household/1", data={
-        "k_qid_1": "Q1", "k_prefix_1": "[]", "v_1": "自购",
-        "k_qid_2": "Q2", "k_prefix_2": '["Q1"]', "v_2": "采摘平台",
+        "k_qid_1": "Q1", "k_prefix_1": "[]", "k_orig_1": "自购", "v_1": "自购",
+        "k_qid_2": "Q2", "k_prefix_2": '["Q1"]', "k_orig_2": "喷药机",
+        "v_2": "采摘平台",
     }, follow_redirects=True).get_data(as_text=True)
     current = values(body)
     assert [q for q, _ in current] == ["Q1", "Q2", "Q7"]
@@ -282,7 +448,7 @@ def test_save_failure_keeps_last_saved_answers(client, monkeypatch):
                         lambda *args, **kwargs: (_ for _ in ()).throw(
                             RuntimeError("disk full")))
     response = client.post("/batch/1/household/2", data={
-        "k_qid_1": "Q1", "k_prefix_1": "[]", "v_1": "自购",
+        "k_qid_1": "Q1", "k_prefix_1": "[]", "k_orig_1": "租赁", "v_1": "自购",
     }, follow_redirects=True)
     assert "disk full" in response.get_data(as_text=True)
 
@@ -304,7 +470,7 @@ def test_database_error_keeps_download_on_last_saved(client, monkeypatch):
 
     monkeypatch.setattr(main.storage, "save_answers", explode)
     response = client.post("/batch/1/household/2", data={
-        "k_qid_1": "Q1", "k_prefix_1": "[]", "v_1": "自购",
+        "k_qid_1": "Q1", "k_prefix_1": "[]", "k_orig_1": "租赁", "v_1": "自购",
     }, follow_redirects=True)
     assert "保存失败" in response.get_data(as_text=True)
     export = client.get("/batch/1/export.csv").data.decode("utf-8-sig")

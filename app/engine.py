@@ -40,6 +40,10 @@ class DefinitionError(ValueError):
     """The questionnaire definition or the submitted answers are unusable."""
 
 
+class ConflictError(DefinitionError):
+    """A submitted edit clashes with the answers saved in the meantime."""
+
+
 def is_blank(value):
     return value is None or str(value).strip() == ""
 
@@ -491,32 +495,67 @@ def import_row(definition, answers):
 def plan_changes(definition, stored, submitted):
     """Storage changes for one submitted edit form.
 
-    ``submitted`` is an ordered list of ``(question_id, prefix, value)``
-    triples, where ``prefix`` is the question sequence the form was rendered
-    with.  A value is accepted only while the re-walk reaches that question
-    with exactly that prefix, so:
+    ``submitted`` is an ordered list of ``(question_id, prefix, original,
+    value)`` quadruples, where ``prefix`` is the question sequence the form
+    was rendered with, ``original`` the value the page showed for that
+    question, and ``value`` the value just submitted.
 
-    * changing an earlier single answer routes the form onto the other
-      branch, and fields of the branch just left are ignored (their answers
-      stay saved under their own path and return when it is walked again);
-    * a question shared by two paths (e.g. the common cost question) keeps
-      one answer per path, and submitting the old path's value never
-      overwrites the other path's saved value.
+    Only fields whose submitted value differs from the page original are
+    applied; clearing a filled answer counts as a change.  Every changed
+    field is first checked against the latest stored answers:
 
-    The walk is recomputed after every accepted value, using the edited
-    answers.  A blank value deletes the answer for that exact path only.
+    * the question must still be reached with exactly that prefix when
+      walking the stored answers, and
+    * the value stored there must equal either the page original or the
+      submitted value (the same edit may already have been saved).
 
-    Returns ``(changes, ignored, routes)`` where ``changes`` maps
+    Otherwise the questions are named in a ``ConflictError`` and the whole
+    submission is rejected, so two windows editing the same household never
+    silently overwrite each other.
+
+    Applying the accepted changes re-walks the questionnaire with the edited
+    answers, so changing an earlier single answer routes the walk onto the
+    other branch and edits on the branch just left are ignored (their
+    answers stay saved under their own path and return when it is walked
+    again).  A question shared by two paths (e.g. the common cost question)
+    keeps one answer per path.  A blank value deletes the answer for that
+    exact path only.
+
+    Returns ``(changes, ignored)`` where ``changes`` maps
     ``(prefix_tuple, qid)`` to a value, or to ``None`` for a deletion, and
-    ``routes`` lists the question ids submitted but not reached.
+    ``ignored`` lists the question ids whose edits were left behind when
+    this submission's own changes re-routed the walk.
     """
-    staged = dict(stored)
     pending = {}
-    for qid, prefix, value in submitted:
-        prefix = tuple(prefix)
-        pending[(prefix, str(qid))] = "" if value is None else str(value)
-    accepted = set()
+    for qid, prefix, original, value in submitted:
+        key = (tuple(prefix), str(qid))
+        value = "" if value is None else str(value)
+        original = "" if original is None else str(original)
+        if value.strip() != original.strip():
+            pending[key] = (original.strip(), value.strip())
+
+    if pending:
+        reachable = {}
+        for step in walk_stored(definition, stored):
+            reachable[(step["prefix"], step["qid"])] = step["value"]
+        titles = {question["id"]: question.get("title") or question["id"]
+                  for question in definition}
+        problems = []
+        for (prefix, qid), (original, value) in pending.items():
+            current = reachable.get((prefix, qid))
+            if current is None:
+                problems.append("题 %s（%s）已无法沿原路径到达"
+                                % (qid, titles.get(qid, qid)))
+            elif current != value and current != original:
+                problems.append(
+                    "题 %s（%s）的已存值与页面原值、本次填写的值都不同"
+                    % (qid, titles.get(qid, qid)))
+        if problems:
+            raise ConflictError("；".join(problems))
+
+    staged = dict(stored)
     changes = {}
+    accepted = set()
 
     prefix = []
     position = 0
@@ -530,7 +569,7 @@ def plan_changes(definition, stored, submitted):
         visited.add(qid)
         key = (tuple(prefix), qid)
         if key in pending:
-            value = pending[key].strip()
+            value = pending[key][1]
             old = staged.get(key)
             if value == "":
                 if old is not None:

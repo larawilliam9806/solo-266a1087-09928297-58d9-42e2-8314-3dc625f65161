@@ -9,8 +9,13 @@ Key behaviours:
   earlier route's answers reappear when the walk returns to it.
 * Exports show each household's current path, its effective answers, and its
   first unanswered question.
-* Saves happen in one transaction; if anything fails, both the web page and
-  the download keep showing the previously saved answers.
+* A save applies only the answers that actually changed relative to what the
+  page showed (clearing a value counts as a change).  Changed questions are
+  checked against the latest saved answers inside one transaction: a
+  question that is no longer reachable on its original path, or whose saved
+  value matches neither the page original nor the submitted value, is a
+  conflict and rejects the whole save.  If anything fails, both the web
+  page and the download keep showing the previously saved answers.
 """
 
 from __future__ import annotations
@@ -162,11 +167,16 @@ def save_household(batch_id, household_id):
         abort(404)
 
     submitted = collect_submitted(request.form)
-    stored = storage.load_answers(connection, household_id)
     try:
-        changes, ignored = engine.plan_changes(
-            info["definition"], stored, submitted)
-        storage.save_answers(connection, household_id, changes)
+        # Load, conflict-check and write inside one immediate transaction:
+        # the plan is verified against the latest committed answers, and two
+        # interleaved saves are serialized instead of losing each other's
+        # changes.
+        with storage.transaction(connection):
+            stored = storage.load_answers(connection, household_id)
+            changes, ignored = engine.plan_changes(
+                info["definition"], stored, submitted)
+            storage.save_answers(connection, household_id, changes)
     except engine.DefinitionError as error:
         connection.close()
         flash("保存失败：%s（网页和下载仍显示上次保存的答卷）" % error, "error")
@@ -184,13 +194,12 @@ def save_household(batch_id, household_id):
     if ignored:
         flash("题 %s 不在当前路径上，未保存" % "、".join(dict.fromkeys(ignored)),
               "warning")
-    saved = sum(1 for value in changes.values() if value is not None)
-    flash("已保存 %d 处修改" % saved, "success")
+    flash("已保存 %d 处修改" % len(changes), "success")
     return _render_household(info, record, current)
 
 
 def collect_submitted(form):
-    """Turn the edit form into ``[(qid, prefix, value)]`` in page order."""
+    """Turn the edit form into ``[(qid, prefix, original, value)]`` in page order."""
     entries = []
     index = 1
     while ("k_qid_%d" % index) in form:
@@ -201,7 +210,8 @@ def collect_submitted(form):
             prefix = tuple(str(item) for item in parsed)
         except (TypeError, ValueError):
             prefix = ()
-        entries.append((qid, prefix, form.get("v_%d" % index, "")))
+        original = form.get("k_orig_%d" % index, "")
+        entries.append((qid, prefix, original, form.get("v_%d" % index, "")))
         index += 1
     return entries
 
